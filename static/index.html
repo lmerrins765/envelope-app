@@ -1,714 +1,944 @@
-"""
-Sporting Life race card scraper.
-Strategy:
-  1. Fetch page with httpx (fast, lightweight).
-  2. Extract __NEXT_DATA__ JSON embedded by Next.js.
-  3. Use the SL-specific parser first (handles actual field names: rides,
-     horse.name, trainer.name, bookmakerOdds, previous_results, etc.).
-  4. Fall back to generic JSON / BeautifulSoup parsing if SL structure not found.
-Correct Sporting Life URL format (individual race):
-  https://www.sportinglife.com/racing/racecards/DATE/VENUE/racecard/RACE_ID/race-slug
-Date listing URL (all races on a day):
-  https://www.sportinglife.com/racing/racecards/DATE
-Venue-only URLs (/racing/racecards/DATE/VENUE) return 404 — the scraper
-automatically redirects them to the date listing and filters by venue.
-"""
-from __future__ import annotations
-import asyncio
-import functools
-import json
-import re
-import logging
-from datetime import date, datetime, timedelta
-from typing import Any, Optional
-import httpx
-from bs4 import BeautifulSoup
-from models import Runner, RaceCard
-log = logging.getLogger(__name__)
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.sportinglife.com/",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Envelope Analyser · Racing Intelligence</title>
+<style>
+:root {
+  --bg:      #09090f; --surface: #111219; --card: #181922; --border: #242636;
+  --gold:    #f0a030; --gold-d:  #c07a18;
+  --green:   #22c55e; --amber:   #f59e0b; --red:  #ef4444; --blue: #3b82f6;
+  --hot:     #ff6b35; --flag:    #f43f5e;
+  --text:    #e2e8f0; --muted:   #94a3b8; --dim:  #64748b;
 }
-# ---------------------------------------------------------------------------
-# Sporting Life – specific helpers
-# ---------------------------------------------------------------------------
-def _going_bucket(going: Optional[str]) -> str:
-    """Normalise a going string to a canonical bucket used in going_record keys."""
-    if not going:
-        return "unknown"
-    g = going.lower()
-    if "heavy" in g:         return "heavy"
-    if "soft" in g:          return "soft"
-    if "yield" in g:         return "soft"
-    if "good to soft" in g:  return "good_soft"
-    if "good to firm" in g:  return "good_firm"
-    if "good" in g:          return "good"
-    if "firm" in g:          return "firm"
-    if "standard" in g:      return "good"   # AW standard
-    if "fast" in g:          return "firm"
-    return "unknown"
-def _sl_distance_to_furlongs(dist_str: str) -> Optional[float]:
-    """Convert SL distance strings to furlongs: '1m 7f 156y' → 15.71, '2m' → 16."""
-    if not dist_str:
-        return None
-    s = dist_str.strip().lower()
-    miles = furlongs = yards = 0.0
-    m = re.search(r'(\d+)m', s)
-    if m:
-        miles = float(m.group(1))
-    f = re.search(r'(\d+(?:\.\d+)?)f', s)
-    if f:
-        furlongs = float(f.group(1))
-    y = re.search(r'(\d+)y', s)
-    if y:
-        yards = float(y.group(1))
-    total = miles * 8 + furlongs + yards / 220
-    return round(total, 2) if total > 0 else None
-def _sl_race_type(race_summary: dict) -> str:
-    """Infer race type from SL race_summary fields."""
-    name = (race_summary.get("name") or "").lower()
-    if "bumper" in name or "nh flat" in name:
-        return "Bumper"
-    if "hurdle" in name:
-        return "Hurdle"
-    if "chase" in name:
-        return "Chase"
-    surface = ((race_summary.get("course_surface") or {}).get("surface") or "").upper()
-    if surface in ("AW", "ALLWEATHER", "ALL_WEATHER"):
-        return "Flat AW"
-    return "Flat"
-def _parse_sl_ride(ride: dict, venue: str) -> Runner:
-    """Map a Sporting Life 'ride' object to a Runner model."""
-    horse = ride.get("horse") or {}
-    name = horse.get("name", "").strip()
-    number = ride.get("cloth_number") or 0
-    draw = ride.get("draw_number")
-    age = horse.get("age")
-    days_since_last_run = horse.get("last_ran_days")
-    # Form: keep only valid racing characters
-    form_raw = ((horse.get("formsummary") or {}).get("display_text") or "")
-    form_str = re.sub(r'[^0-9FUPRBCS/\-]', '', form_raw.upper()) or None
-    trainer = ((ride.get("trainer") or {}).get("name") or "").strip() or None
-    jockey = ((ride.get("jockey") or {}).get("name") or "").strip() or None
-    official_rating = ride.get("official_rating")
-    # Weight: "9-4" → 9st 4lb
-    weight_st = weight_lb = None
-    weight_total_lb = None
-    wt = ride.get("handicap") or ""
-    if wt:
-        wm = re.match(r'(\d+)-(\d+)', str(wt))
-        if wm:
-            weight_st = int(wm.group(1))
-            weight_lb = int(wm.group(2))
-            weight_total_lb = weight_st * 14.0 + weight_lb
-    non_runner = ride.get("ride_status", "RUNNER") in ("WITHDRAWN", "NON_RUNNER", "SCRATCHED")
-    # Odds: current_odds first, then best bookmaker price, then forecast (set later)
-    betting = ride.get("betting") or {}
-    odds = betting.get("current_odds") or ""
-    if not odds:
-        bm_list = ride.get("bookmakerOdds") or []
-        best_bm = next((b for b in bm_list if b.get("bestOdds")), bm_list[0] if bm_list else None)
-        if best_bm:
-            odds = best_bm.get("fractionalOdds") or ""
-    odds_decimal = _parse_decimal_odds(odds) if odds else None
-    # Build records from previous_results (most-recent-first in SL JSON)
-    prev = horse.get("previous_results") or []
-    or_history: list[int] = []
-    or_trip_history: list[float] = []
-    going_record: dict[str, list[int]] = {}
-    distance_record: dict[str, list[int]] = {}
-    course_wins = 0
-    course_runs = 0
-    venue_history: list[str] = []
-    for pr in prev:
-        bha = pr.get("bha")
-        dist_f = _sl_distance_to_furlongs(pr.get("distance") or "")
-        going_str = pr.get("going") or ""
-        pos = pr.get("position") or 0
-        course = pr.get("course_name") or ""
-        if isinstance(bha, (int, float)) and bha:
-            or_history.append(int(bha))
-            if dist_f:
-                or_trip_history.append(dist_f)
-        g_bucket = _going_bucket(going_str)
-        if g_bucket and g_bucket != "unknown":
-            going_record.setdefault(g_bucket, [0, 0])
-            going_record[g_bucket][1] += 1
-            if pos == 1:
-                going_record[g_bucket][0] += 1
-        if dist_f:
-            dkey = str(int(round(dist_f)))
-            distance_record.setdefault(dkey, [0, 0])
-            distance_record[dkey][1] += 1
-            if pos == 1:
-                distance_record[dkey][0] += 1
-        if course:
-            venue_history.append(course)
-            if venue and venue.lower() in course.lower():
-                course_runs += 1
-                if pos == 1:
-                    course_wins += 1
-    # Reverse so order is oldest → newest (as scorer expects)
-    or_history.reverse()
-    or_trip_history.reverse()
-    venue_history.reverse()
-    return Runner(
-        name=name,
-        number=number,
-        draw=draw,
-        age=age,
-        form=form_str,
-        days_since_last_run=days_since_last_run,
-        trainer=trainer,
-        jockey=jockey,
-        official_rating=official_rating,
-        weight_st=weight_st,
-        weight_lb=weight_lb,
-        weight_total_lb=weight_total_lb,
-        odds=odds or None,
-        odds_decimal=odds_decimal,
-        non_runner=non_runner,
-        or_history=or_history,
-        or_trip_history=or_trip_history,
-        going_record=going_record,
-        distance_record=distance_record,
-        course_wins=course_wins,
-        course_runs=course_runs,
-        venue_history=venue_history,
-    )
-def _build_racecard_from_sl_race(race_obj: dict, url: str) -> Optional[RaceCard]:
-    """Build a RaceCard from a SL race object (pageProps.race or nextTenRaces entry)."""
-    rs = race_obj.get("race_summary") or {}
-    venue = rs.get("course_name") or ""
-    going = rs.get("going") or ""
-    dist_f = _sl_distance_to_furlongs(rs.get("distance") or "")
-    prizes_obj = race_obj.get("prizes") or {}
-    prize_money = None
-    if isinstance(prizes_obj, dict):
-        raw = (prizes_obj.get("total") or prizes_obj.get("firstPrize")
-               or prizes_obj.get("prize") or prizes_obj.get("totalPrize"))
-        prize_money = str(raw) if raw else None
-    race = RaceCard(
-        url=url,
-        title=rs.get("name") or "",
-        venue=venue,
-        date=rs.get("date") or "",
-        going=going,
-        race_type=_sl_race_type(rs),
-        race_class=str(rs.get("race_class") or "") or None,
-        distance_furlongs=dist_f,
-        prize_money=prize_money,
-    )
-    # Build a name→odds lookup from the betting forecast string
-    # e.g. "Mermaids Cave (13/8), Pigeon House (2/1), ..."
-    forecast_str = race_obj.get("betting_forecast") or ""
-    forecast_odds: dict[str, str] = {}
-    if forecast_str and "No Forecast" not in forecast_str:
-        for fm in re.finditer(r'([A-Za-z][^()]{1,50}?)\s*\(([^)]+)\)', forecast_str):
-            forecast_odds[fm.group(1).strip().lower()] = fm.group(2).strip()
-    runners: list[Runner] = []
-    # FIX: accept rides under either 'rides' or 'runners' key
-    ride_list = race_obj.get("rides") or race_obj.get("runners") or []
-    for ride in ride_list:
-        if not isinstance(ride, dict):
-            continue
-        runner = _parse_sl_ride(ride, venue)
-        if not runner.name:
-            continue
-        # Use forecast odds as fallback when no live price is available
-        if not runner.odds:
-            fc = forecast_odds.get(runner.name.lower()) or ""
-            if fc:
-                runner.odds = fc
-                runner.odds_decimal = _parse_decimal_odds(fc)
-        runners.append(runner)
-    race.runners = runners
-    race.total_runners = len([r for r in runners if not r.non_runner])
-    return race if runners else None
-def _extract_race_id_from_url(url: str) -> Optional[str]:
-    """Extract the numeric race ID from a SL racecard URL."""
-    m = re.search(r'/racecard/(\d+)(?:/|$)', url)
-    return m.group(1) if m else None
-def _try_parse_sl_racecard(pp: dict, url: str) -> Optional[RaceCard]:
-    """
-    Parse Sporting Life's __NEXT_DATA__ pageProps into a RaceCard.
-    Handles:
-      - Individual race pages: pageProps.race  (has full rides + odds)
-      - Date listing pages:    pageProps.nextTenRaces[n]  (next races with riders)
-    """
-    # Extract race ID from URL for precise nextTenRaces matching
-    race_id = _extract_race_id_from_url(url)
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{min-height:100%;background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;line-height:1.5}
+.mono{font-family:'Cascadia Code','Courier New',monospace}
 
-    # Path 1: specific race card page → pageProps.race
-    # FIX: check for 'rides' OR 'runners' key; use 'is not None' to avoid
-    # empty-list falsy bug that caused second-parse failures.
-    race_obj = pp.get("race")
-    if isinstance(race_obj, dict):
-        ride_list = race_obj.get("rides")
-        if ride_list is None:
-            ride_list = race_obj.get("runners")
-        if ride_list is not None:   # key present (even if list is temporarily empty)
-            # Normalise to 'rides' key for _build_racecard_from_sl_race
-            if "rides" not in race_obj and ride_list:
-                race_obj = {**race_obj, "rides": ride_list}
-            result = _build_racecard_from_sl_race(race_obj, url)
-            if result:
-                log.info("SL parser: using pageProps.race")
-                return result
+/* ── Shared ── */
+.container{max-width:1440px;margin:0 auto;padding:0 1rem;width:100%}
+.btn{display:inline-flex;align-items:center;gap:.4rem;padding:.42rem .9rem;border-radius:6px;font-size:.83rem;font-weight:600;cursor:pointer;border:none;transition:opacity .15s,transform .1s;white-space:nowrap}
+.btn:hover{opacity:.85}.btn:active{transform:scale(.97)}
+.btn-gold{background:var(--gold);color:#000}
+.btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--muted);color:var(--text)}
+.btn-sm{padding:.28rem .65rem;font-size:.76rem}
+.btn-danger{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.25)}
 
-    # Path 1b: pageProps.races array (some SL page variants)
-    races_list = pp.get("races")
-    if isinstance(races_list, list):
-        for entry in races_list:
-            if not isinstance(entry, dict):
-                continue
-            # Prefer exact race ID match
-            if race_id:
-                rs = entry.get("race_summary") or {}
-                entry_id = str(rs.get("id") or entry.get("id") or "")
-                if entry_id and entry_id != race_id:
-                    continue
-            ride_list = entry.get("rides") or entry.get("runners") or []
-            if ride_list:
-                result = _build_racecard_from_sl_race(entry, url)
-                if result:
-                    log.info("SL parser: using pageProps.races entry")
-                    return result
+/* ── Badges ── */
+.badge{display:inline-flex;align-items:center;gap:.2rem;border-radius:4px;padding:.1rem .4rem;font-size:.68rem;font-weight:700;white-space:nowrap}
+.badge-course  {background:rgba(240,160,48,.2); color:var(--gold); border:1px solid rgba(240,160,48,.35)}
+.badge-warning {background:rgba(245,158,11,.15);color:var(--amber)}
+.badge-danger  {background:rgba(239,68,68,.15); color:var(--red)}
+.badge-info    {background:rgba(59,130,246,.15);color:var(--blue)}
+.badge-neutral {background:rgba(148,163,184,.1);color:var(--muted)}
+.badge-hot     {background:rgba(255,107,53,.15);color:var(--hot)}
+.badge-green   {background:rgba(34,197,94,.15); color:var(--green)}
 
-    # Path 2: date listing → nextTenRaces, filtered by race ID or venue slug
-    venue_slug = None
-    m = re.search(r'/racing/racecards/\d{4}-\d{2}-\d{2}/([a-z0-9-]+)', url, re.I)
-    if m:
-        venue_slug = m.group(1).lower()
+/* ── Header ── */
+header{background:linear-gradient(135deg,#0d0f18,#131520);border-bottom:1px solid var(--border);padding:.7rem 0;position:sticky;top:0;z-index:50}
+.header-inner{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:.55rem;text-decoration:none;color:inherit}
+.brand-icon{width:34px;height:34px;background:var(--gold);border-radius:6px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:1rem;color:#000}
+.brand-text{line-height:1.1}
+.brand-name{font-size:.9rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase}
+.brand-sub{font-size:.62rem;color:var(--muted);letter-spacing:.15em;text-transform:uppercase}
+.url-form{display:flex;gap:.45rem;flex:1;min-width:180px}
+.url-input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:.42rem .7rem;color:var(--text);font-size:.83rem;outline:none;transition:border-color .2s}
+.url-input:focus{border-color:var(--gold)}
+.url-input::placeholder{color:var(--dim)}
+#loading{display:none;align-items:center;gap:.4rem;font-size:.82rem;color:var(--muted)}
+#loading.show{display:flex}
+.spinner{width:15px;height:15px;border:2px solid var(--border);border-top-color:var(--gold);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 
-    for entry in (pp.get("nextTenRaces") or []):
-        if not isinstance(entry, dict):
-            continue
-        ride_list = entry.get("rides") or entry.get("runners") or []
-        if not ride_list:
-            continue
-        rs = entry.get("race_summary") or {}
-        # Prefer exact race ID match when available
-        if race_id:
-            entry_id = str(rs.get("id") or entry.get("id") or "")
-            if entry_id == race_id:
-                log.info("SL parser: using nextTenRaces entry (race ID match)")
-                return _build_racecard_from_sl_race(entry, url)
-        # Fall back to venue slug matching
-        if venue_slug:
-            course_slug = rs.get("course_name", "").lower().replace(" ", "-")
-            if venue_slug not in course_slug and course_slug not in venue_slug:
-                continue
-        log.info("SL parser: using pageProps.nextTenRaces entry")
-        return _build_racecard_from_sl_race(entry, url)
+/* ── Error ── */
+#error-banner{display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);border-radius:8px;padding:.65rem 1rem;color:#fca5a5;margin:.75rem 0;font-size:.83rem}
+#error-banner.show{display:block}
 
-    return None
-def _sl_fallback_url(url: str) -> Optional[str]:
-    """
-    If the URL is a venue-only SL racecard URL (which returns 404),
-    return the date-listing URL to try instead.
-    e.g. /racing/racecards/2026-03-04/cheltenham  →  /racing/racecards/2026-03-04
-    """
-    m = re.match(
-        r'(https://www\.sportinglife\.com/racing/racecards/\d{4}-\d{2}-\d{2})/[a-z0-9-]+/?$',
-        url.rstrip("/"),
-        re.I,
-    )
-    return m.group(1) if m else None
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-def _fetch_with_requests(url: str) -> str:
-    """Synchronous fallback using the requests library."""
-    import requests  # optional dependency; only imported on fallback path
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    resp = session.get(url, timeout=20, allow_redirects=True)
-    resp.raise_for_status()
-    return resp.text
-async def _fetch_html(url: str) -> tuple[str | None, str]:
-    """
-    Fetch a URL, returning (html, last_error).
-    Tries httpx first, then a synchronous requests fallback.
-    """
-    html: str | None = None
-    last_error = ""
-    try:
-        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
-            resp = await client.get(url)
-        if resp.status_code == 200:
-            html = resp.text
-        else:
-            last_error = f"HTTP {resp.status_code}"
-            log.warning("httpx got HTTP %s for %s", resp.status_code, url)
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError, OSError) as exc:
-        last_error = str(exc)
-        log.warning("httpx failed (%s), trying requests fallback", exc)
-    if html is None:
-        try:
-            loop = asyncio.get_event_loop()
-            html = await loop.run_in_executor(None, functools.partial(_fetch_with_requests, url))
-            log.info("requests fallback succeeded for %s", url)
-        except Exception as exc:
-            log.warning("requests fallback also failed: %s", exc)
-            if not last_error or "getaddrinfo" in str(exc) or "ConnectionError" in type(exc).__name__:
-                last_error = str(exc)
-    return html, last_error
-async def fetch_racecard(url: str) -> RaceCard:
-    """Fetch and parse a Sporting Life race card URL. Returns a RaceCard."""
-    log.info("Fetching: %s", url)
-    original_url = url
-    html, last_error = await _fetch_html(url)
-    # If the URL looks like a venue-only URL (which returns 404 from SL's Next.js),
-    # automatically try the date listing URL instead.
-    if html is None or (html and '"statusCode":404' in html and '/racecard/' not in url):
-        fallback = _sl_fallback_url(url)
-        if fallback and fallback != url:
-            log.info("Trying date-listing fallback: %s", fallback)
-            html2, err2 = await _fetch_html(fallback)
-            if html2:
-                html = html2
-                url = fallback  # use this URL for parser context (venue slug still in original_url)
-                last_error = ""
-    if html is None:
-        if "getaddrinfo" in last_error or "11004" in last_error or "Name or service not known" in last_error:
-            detail = (
-                "DNS lookup failed — your network could not resolve 'www.sportinglife.com'.\n"
-                "• Check your internet connection and DNS settings\n"
-                "• Try opening https://www.sportinglife.com in a browser first"
-            )
-        elif "timed out" in last_error.lower() or "timeout" in last_error.lower():
-            detail = "The request to Sporting Life timed out. The site may be slow or blocking requests."
-        elif "403" in last_error or "429" in last_error:
-            detail = (
-                "Sporting Life is blocking automated requests (anti-bot protection). "
-                "Try copying the race data manually."
-            )
-        else:
-            detail = last_error or "Unknown network error."
-        raise ValueError(
-            f"Could not fetch the Sporting Life page.\n{detail}\n\n"
-            "Tip: use the 'Load Sample' button to explore the app without a live URL."
-        )
-    # Pass the original URL so venue slug filtering works correctly
-    race = _try_parse_next_data(html, original_url)
-    if race:
-        log.info("Parsed from __NEXT_DATA__ JSON (%d runners)", len(race.runners))
-        return race
-    race = _try_parse_inline_json(html, original_url)
-    if race:
-        log.info("Parsed from inline JSON")
-        return race
-    race = _parse_html(html, original_url)
-    if race and race.runners:
-        log.info("Parsed from HTML (found %d runners)", len(race.runners))
-        return race
-    raise ValueError(
-        "Could not extract race card data from this page.\n"
-        "For best results use a specific race URL:\n"
-        "  sportinglife.com/racing/racecards/DATE/VENUE/racecard/RACE_ID/race-name\n\n"
-        "Tip: use the 'Load Sample' button to explore the app without a live URL."
-    )
-# ---------------------------------------------------------------------------
-# Parser: __NEXT_DATA__
-# ---------------------------------------------------------------------------
-def _try_parse_next_data(html: str, url: str) -> Optional[RaceCard]:
-    """Try to extract runner data from Next.js __NEXT_DATA__ script tag."""
-    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
-    props = data.get("props", {}).get("pageProps", {})
-    # --- Sporting Life-specific parser (highest priority) ---
-    race = _try_parse_sl_racecard(props, url)
-    if race:
-        return race
-    # --- Generic Next.js fallback (other racing sites) ---
-    for key in ("raceCard", "racecard", "event", "meeting"):
-        if key in props:
-            return _extract_from_obj(props[key], url)
-    runners_obj = _deep_find(props, "runners")
-    if runners_obj:
-        return _build_racecard_from_runners(runners_obj, props, url)
-    return None
-def _try_parse_inline_json(html: str, url: str) -> Optional[RaceCard]:
-    """Look for large JSON objects in other <script> tags."""
-    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.S)
-    for script in scripts:
-        script = script.strip()
-        if '"runners"' not in script and '"horses"' not in script:
-            continue
-        # FIX: use a targeted non-greedy search for JSON objects containing runners.
-        # The previous greedy regex could match the entire script as one broken object.
-        # Try to parse the whole script first (handles window.__data = {...} patterns).
-        clean = re.sub(r'^\s*(?:window\.[A-Za-z_$][^=]*=\s*)?', '', script)
-        clean = clean.rstrip(';').strip()
-        if clean.startswith('{'):
-            try:
-                obj = json.loads(clean)
-                rc = _extract_from_obj(obj, url)
-                if rc and rc.runners:
-                    return rc
-            except json.JSONDecodeError:
-                pass
-        # Fallback: find individual JSON objects with a bounded non-greedy search
-        for m in re.finditer(r'\{[^{}]{0,200}"runners"[^{}]{0,200}\}', script):
-            try:
-                obj = json.loads(m.group(0))
-                rc = _extract_from_obj(obj, url)
-                if rc and rc.runners:
-                    return rc
-            except json.JSONDecodeError:
-                continue
-    return None
-# ---------------------------------------------------------------------------
-# Parser: HTML fallback
-# ---------------------------------------------------------------------------
-def _parse_html(html: str, url: str) -> RaceCard:
-    """BeautifulSoup fallback for static HTML race card content."""
-    soup = BeautifulSoup(html, "lxml")
-    race = RaceCard(url=url)
-    # --- Race title / venue ---
-    h1 = soup.find("h1")
-    if h1:
-        race.title = h1.get_text(strip=True)
-    # --- Meta info (going, distance, class) ---
-    # Look for common data-attribute patterns used by racing sites
-    for el in soup.find_all(attrs={"data-going": True}):
-        race.going = el["data-going"]
-    for el in soup.find_all(attrs={"data-distance": True}):
-        try:
-            race.distance_furlongs = float(el["data-distance"])
-        except ValueError:
-            pass
-    # --- Try to find runner rows ---
-    # Sporting Life uses React-rendered divs; look for common class patterns
-    runners = []
-    # Pattern A: rows with horse name links
-    horse_links = soup.find_all("a", href=re.compile(r"/racing/profiles/horse/"))
-    for link in horse_links:
-        name = link.get_text(strip=True)
-        if not name or len(name) < 2:
-            continue
-        runner = Runner(name=name)
-        # Try to get surrounding row context
-        row = link.find_parent(["tr", "div", "li"])
-        if row:
-            _enrich_runner_from_tag(runner, row)
-        runners.append(runner)
-    # Pattern B: structured table rows
-    if not runners:
-        for row in soup.find_all("tr"):
-            cells = row.find_all("td")
-            if len(cells) >= 4:
-                runner = _parse_table_row(cells)
-                if runner:
-                    runners.append(runner)
-    race.runners = runners
-    race.total_runners = len(runners)
-    return race
-def _enrich_runner_from_tag(runner: Runner, tag) -> None:
-    """Try to pull jockey, trainer, weight, OR, draw from a containing element."""
-    text = tag.get_text(" ", strip=True)
-    # Weight e.g. "9-2" or "9st 2lb"
-    wt = re.search(r'(\d+)[- ](\d+)', text)
-    if wt:
-        st, lb = int(wt.group(1)), int(wt.group(2))
-        if 7 <= st <= 12:
-            runner.weight_st = st
-            runner.weight_lb = lb
-            runner.weight_total_lb = st * 14 + lb
-    # OR e.g. "OR 95" or just a number 70-170
-    or_match = re.search(r'\bOR\s*(\d+)', text, re.I)
-    if or_match:
-        runner.official_rating = int(or_match.group(1))
-    # Form – sequences of digits and form chars
-    form_match = re.search(r'[0-9FUPRBCS][0-9FUPRBCS\-\/\.]{2,}', text, re.I)
-    if form_match:
-        runner.form = form_match.group(0)
-def _parse_table_row(cells) -> Optional[Runner]:
-    texts = [c.get_text(strip=True) for c in cells]
-    if not any(t for t in texts if len(t) > 2):
-        return None
-    runner = Runner(name=texts[1] if len(texts) > 1 else texts[0])
-    for t in texts:
-        if re.fullmatch(r'\d+', t) and 60 <= int(t) <= 175:
-            runner.official_rating = int(t)
-    return runner
-# ---------------------------------------------------------------------------
-# JSON object extraction helpers
-# ---------------------------------------------------------------------------
-def _extract_from_obj(obj: Any, url: str) -> Optional[RaceCard]:
-    """Try to build a RaceCard from an arbitrary parsed JSON object."""
-    if not isinstance(obj, dict):
-        return None
-    race = RaceCard(url=url)
-    # Race metadata
-    race.title = obj.get("name") or obj.get("title") or obj.get("raceName") or ""
-    race.venue = obj.get("venue") or obj.get("course") or obj.get("courseName") or ""
-    race.going = obj.get("going") or obj.get("groundConditions") or ""
-    race.race_type = obj.get("type") or obj.get("raceType") or ""
-    race.race_class = str(obj.get("class") or obj.get("raceClass") or "")
-    race.prize_money = obj.get("prizeMoney") or obj.get("prize") or ""
-    dist = obj.get("distanceFurlongs") or obj.get("distance")
-    if dist is not None:
-        try:
-            race.distance_furlongs = float(dist)
-        except (ValueError, TypeError):
-            pass
-    date_str = obj.get("date") or obj.get("raceDate") or obj.get("startTime") or ""
-    if date_str:
-        race.date = str(date_str)[:10]
-    runners_raw = (
-        obj.get("runners") or obj.get("horses") or obj.get("entrants") or []
-    )
-    if not isinstance(runners_raw, list) or not runners_raw:
-        return None
-    race.runners = [_parse_runner_obj(r) for r in runners_raw if isinstance(r, dict)]
-    race.runners = [r for r in race.runners if r.name]
-    race.total_runners = len(race.runners)
-    return race if race.runners else None
-def _parse_runner_obj(obj: dict) -> Runner:
-    runner = Runner(
-        name=(
-            obj.get("name") or obj.get("horseName") or obj.get("horse") or ""
-        ).strip(),
-        number=_int(obj.get("number") or obj.get("saddleCloth") or obj.get("runnerId")),
-        jockey=(obj.get("jockey") or obj.get("jockeyName") or ""),
-        trainer=(obj.get("trainer") or obj.get("trainerName") or ""),
-        official_rating=_int(obj.get("officialRating") or obj.get("or") or obj.get("rating")),
-        draw=_int(obj.get("draw") or obj.get("stall") or obj.get("barrierDraw")),
-        form=(obj.get("form") or obj.get("formFigures") or obj.get("recentForm") or ""),
-        odds=(obj.get("odds") or obj.get("price") or obj.get("startingPrice") or ""),
-    )
-    # Age
-    age_raw = obj.get("age") or obj.get("horseAge")
-    if age_raw is not None:
-        try:
-            runner.age = int(str(age_raw).replace("y", "").strip())
-        except ValueError:
-            pass
-    # Weight
-    wt_raw = obj.get("weight") or obj.get("weightCarried") or obj.get("lbs")
-    if wt_raw is not None:
-        _parse_weight_into(runner, wt_raw)
-    # Odds decimal
-    runner.odds_decimal = _parse_decimal_odds(runner.odds)
-    # Days since last run
-    last_run = obj.get("lastRun") or obj.get("daysSinceLastRun") or obj.get("daysSinceRun")
-    if last_run is not None:
-        try:
-            runner.days_since_last_run = int(last_run)
-        except (ValueError, TypeError):
-            pass
-    return runner
-def _parse_weight_into(runner: Runner, raw) -> None:
-    """Parse various weight formats into stone/lb and total_lb."""
-    try:
-        if isinstance(raw, (int, float)):
-            runner.weight_total_lb = float(raw)
-            runner.weight_st = int(raw) // 14
-            runner.weight_lb = int(raw) % 14
-            return
-        s = str(raw).strip()
-        # "9-2" or "9st 2lb"
-        m = re.match(r'(\d+)[\-\s](\d+)', s)
-        if m:
-            st, lb = int(m.group(1)), int(m.group(2))
-            if 7 <= st <= 12:
-                runner.weight_st = st
-                runner.weight_lb = lb
-                runner.weight_total_lb = st * 14.0 + lb
-    except (ValueError, TypeError):
-        pass
-def _parse_decimal_odds(odds_str: Optional[str]) -> Optional[float]:
-    if not odds_str:
-        return None
-    s = str(odds_str).strip().upper()
-    if s in ("EVS", "EVENS", "1/1"):
-        return 2.0
-    if "/" in s:
-        try:
-            num, denom = s.split("/")
-            return round(int(num) / int(denom) + 1, 2)
-        except (ValueError, ZeroDivisionError):
-            return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-def _build_racecard_from_runners(runners_raw: Any, props: dict, url: str) -> Optional[RaceCard]:
-    if not isinstance(runners_raw, list):
-        return None
-    race = RaceCard(url=url)
-    race.runners = [_parse_runner_obj(r) for r in runners_raw if isinstance(r, dict)]
-    race.runners = [r for r in race.runners if r.name]
-    race.total_runners = len(race.runners)
-    return race if race.runners else None
-def _deep_find(obj: Any, key: str, depth: int = 0) -> Any:
-    """Recursively search a nested dict/list for a given key."""
-    if depth > 6:
-        return None
-    if isinstance(obj, dict):
-        if key in obj:
-            return obj[key]
-        for v in obj.values():
-            result = _deep_find(v, key, depth + 1)
-            if result is not None:
-                return result
-    elif isinstance(obj, list):
-        for item in obj:
-            result = _deep_find(item, key, depth + 1)
-            if result is not None:
-                return result
-    return None
-def _int(val) -> Optional[int]:
-    if val is None:
-        return None
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return None
-# ---------------------------------------------------------------------------
-# Sample / demo race card (used when scraping is unavailable)
-# ---------------------------------------------------------------------------
-def get_sample_racecard() -> RaceCard:
-    """Return a realistic sample race card for demo purposes."""
-    today = date.today().isoformat()
-    runners = [
-        Runner(name="Appreciate It",     age=7,  weight_st=11, weight_lb=10, weight_total_lb=164, jockey="Paul Townend",     trainer="Willie Mullins",    official_rating=168, draw=5,  form="1-1-1-2-1",   odds="7/4",  odds_decimal=2.75, days_since_last_run=21, course_wins=2, course_runs=3, running_style="Prominent"),
-        Runner(name="Constitution Hill", age=8,  weight_st=11, weight_lb=12, weight_total_lb=166, jockey="Nico de Boinville",trainer="Nicky Henderson",  official_rating=174, draw=3,  form="1-1-1-1-2-1", odds="5/4",  odds_decimal=2.25, days_since_last_run=28, course_wins=3, course_runs=4, running_style="Leads"),
-        Runner(name="Shishkin",          age=9,  weight_st=11, weight_lb=8,  weight_total_lb=162, jockey="Nico de Boinville",trainer="Nicky Henderson",  official_rating=170, draw=1,  form="1-2-1-F-1-2", odds="9/2",  odds_decimal=5.50, days_since_last_run=35, course_wins=1, course_runs=3, running_style="Tracks Leader"),
-        Runner(name="Energumene",        age=10, weight_st=11, weight_lb=6,  weight_total_lb=160, jockey="Paul Townend",     trainer="Willie Mullins",    official_rating=165, draw=8,  form="2-1-2-1-3-1", odds="6/1",  odds_decimal=7.00, days_since_last_run=42, course_wins=0, course_runs=2, running_style="Prominent"),
-        Runner(name="El Fabiolo",        age=7,  weight_st=11, weight_lb=4,  weight_total_lb=158, jockey="Paul Townend",     trainer="Willie Mullins",    official_rating=171, draw=2,  form="1-1-1-1-P-1", odds="3/1",  odds_decimal=4.00, days_since_last_run=18, course_wins=1, course_runs=2, running_style="Tracks Leader"),
-        Runner(name="Ferny Hollow",      age=8,  weight_st=11, weight_lb=2,  weight_total_lb=156, jockey="Paul Townend",     trainer="Willie Mullins",    official_rating=158, draw=6,  form="3-2-1-2-1-3", odds="10/1", odds_decimal=11.0, days_since_last_run=56, course_wins=0, course_runs=1, running_style="Midfield"),
-        Runner(name="Janidil",           age=9,  weight_st=11, weight_lb=0,  weight_total_lb=154, jockey="Mark Walsh",       trainer="Willie Mullins",    official_rating=154, draw=7,  form="2-3-1-4-2-1", odds="14/1", odds_decimal=15.0, days_since_last_run=70, course_wins=0, course_runs=0, running_style="Hold Up"),
-        Runner(name="Funambule Sivola",  age=7,  weight_st=10, weight_lb=12, weight_total_lb=152, jockey="Harry Cobden",     trainer="Venetia Williams",  official_rating=150, draw=4,  form="1-3-2-3-1-4", odds="20/1", odds_decimal=21.0, days_since_last_run=14, course_wins=0, course_runs=0, running_style="Hold Up"),
-        Runner(name="Darasso",           age=10, weight_st=10, weight_lb=10, weight_total_lb=150, jockey="Tom Scudamore",    trainer="Dan Skelton",       official_rating=148, draw=9,  form="4-3-2-3-2-3", odds="25/1", odds_decimal=26.0, days_since_last_run=90, course_wins=0, course_runs=0, running_style="Midfield"),
-        Runner(name="Solo",              age=8,  weight_st=10, weight_lb=8,  weight_total_lb=148, jockey="Rachael Blackmore",trainer="Henry de Bromhead", official_rating=145, draw=10, form="2-5-1-3-4-2", odds="33/1", odds_decimal=34.0, days_since_last_run=105,course_wins=0, course_runs=1, running_style="Hold Up"),
-    ]
-    return RaceCard(
-        title="Betway Queen Mother Champion Chase (Grade 1)",
-        venue="Cheltenham",
-        date=today,
-        race_type="Chase",
-        race_class="Grade 1",
-        distance_furlongs=16.0,
-        going="Good to Soft",
-        prize_money="£400,000",
-        runners=runners,
-        total_runners=len(runners),
-        url="sample",
-    )
+/* ── Stats panel ── */
+.stats-panel{background:var(--surface);border:1px solid var(--border);border-radius:10px;margin:.75rem 0;overflow:hidden}
+.stats-panel-header{display:flex;align-items:center;gap:.75rem;padding:.65rem 1rem;cursor:pointer;user-select:none}
+.stats-panel-header:hover{background:rgba(255,255,255,.02)}
+.stats-toggle{font-size:.78rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);flex:1}
+.stats-pill{font-size:.7rem;padding:.15rem .5rem;border-radius:20px;border:1px solid var(--border);color:var(--dim)}
+.stats-pill.loaded{color:var(--green);border-color:rgba(34,197,94,.3)}
+.stats-body{display:none;padding:.75rem 1rem 1rem;border-top:1px solid var(--border)}
+.stats-body.open{display:block}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.6rem;margin-bottom:.75rem}
+.upload-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.7rem .85rem}
+.upload-card-label{font-size:.73rem;font-weight:700;color:var(--muted);margin-bottom:.4rem;text-transform:uppercase;letter-spacing:.07em}
+.upload-card-status{font-size:.75rem;margin-top:.35rem}
+.upload-card-status.ok{color:var(--green)}
+.upload-card-status.pending{color:var(--dim)}
+.file-btn{display:inline-flex;align-items:center;gap:.3rem;background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:.3rem .65rem;font-size:.75rem;font-weight:600;cursor:pointer;color:var(--muted);transition:border-color .2s}
+.file-btn:hover{border-color:var(--gold);color:var(--text)}
+.file-btn input[type=file]{display:none}
+.text-row{display:flex;gap:.6rem;margin-bottom:.5rem;flex-wrap:wrap}
+.text-input-group{flex:1;min-width:200px}
+.text-input-group label{display:block;font-size:.72rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:.3rem}
+.text-input{width:100%;background:var(--card);border:1px solid var(--border);border-radius:6px;padding:.38rem .65rem;color:var(--text);font-size:.83rem;outline:none;transition:border-color .2s}
+.text-input:focus{border-color:var(--gold)}
+.fav-display{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.5rem .85rem;font-size:.8rem;color:var(--muted);margin-top:.4rem}
+
+/* ── Main ── */
+main{flex:1;padding:1rem 0}
+
+/* ── Selections ── */
+.selections{display:grid;grid-template-columns:1fr 1fr;gap:.85rem;margin-bottom:1.25rem}
+@media(max-width:600px){.selections{grid-template-columns:1fr}}
+.selection-card{border-radius:10px;padding:.9rem 1.1rem;position:relative;overflow:hidden;border:1px solid}
+.sel-winner{border-color:rgba(240,160,48,.4);color:var(--gold)}
+.sel-ew    {border-color:rgba(59,130,246,.4);color:var(--blue)}
+.sel-label {font-size:.68rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:.35rem}
+.sel-horse {font-size:1.15rem;font-weight:700;color:var(--text);margin-bottom:.2rem;line-height:1.2}
+.sel-meta  {display:flex;gap:.6rem;flex-wrap:wrap;font-size:.78rem;color:var(--muted)}
+.sel-score {position:absolute;top:.85rem;right:1rem;font-size:1.4rem;font-weight:800;font-family:monospace}
+.sel-odds  {font-weight:700;font-size:.88rem;color:var(--text)}
+.alignment-bar{margin-top:.6rem;padding:.4rem .65rem;border-radius:6px;font-size:.75rem;font-weight:600;border:1px solid}
+.align-ok     {background:rgba(34,197,94,.1); border-color:rgba(34,197,94,.25); color:var(--green)}
+.align-warn   {background:rgba(245,158,11,.1);border-color:rgba(245,158,11,.25);color:var(--amber)}
+.align-switch {background:rgba(239,68,68,.1); border-color:rgba(239,68,68,.25); color:var(--red)}
+.market-alt{margin-top:.4rem;padding:.35rem .65rem;border-radius:6px;background:rgba(255,255,255,.04);border:1px solid var(--border);font-size:.75rem;color:var(--muted)}
+.empty-sel{display:flex;align-items:center;justify-content:center;min-height:75px;color:var(--dim);font-size:.83rem}
+
+/* ── Race info ── */
+#race-info{display:none;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.65rem 1rem;margin-bottom:1.1rem}
+#race-info.show{display:flex;flex-wrap:wrap;align-items:center;gap:.45rem 1.1rem}
+.race-title{font-weight:700;font-size:.93rem}
+.race-pill{display:inline-flex;align-items:center;gap:.25rem;background:var(--card);border:1px solid var(--border);border-radius:20px;padding:.18rem .6rem;font-size:.73rem;color:var(--muted)}
+.fav-stat{font-size:.73rem;color:var(--dim);padding:.18rem .6rem;background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.2);border-radius:20px}
+
+/* ── Table ── */
+#runners-section{display:none}
+#runners-section.show{display:block}
+.table-wrap{overflow-x:auto;border-radius:10px;border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;min-width:720px}
+thead th{background:var(--surface);padding:.55rem .85rem;text-align:left;font-size:.7rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);white-space:nowrap;cursor:pointer;user-select:none;border-bottom:1px solid var(--border)}
+thead th:hover{color:var(--muted)}
+thead th.sort-asc::after{content:' ↑';color:var(--gold)}
+thead th.sort-desc::after{content:' ↓';color:var(--gold)}
+tbody tr{border-bottom:1px solid var(--border);cursor:pointer}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover td{background:rgba(255,255,255,.02)}
+tbody tr.expanded>td{background:rgba(240,160,48,.03)}
+td{padding:.6rem .85rem;vertical-align:middle;white-space:nowrap}
+.td-rank{font-weight:700;color:var(--gold);min-width:28px}
+.rank-1{color:#ffd700}.rank-2{color:#c0c0c0}.rank-3{color:#cd7f32}
+.horse-name{font-weight:600;font-size:.88rem}
+.horse-meta{font-size:.7rem;color:var(--dim)}
+.td-flag{color:var(--flag);font-size:.78rem}
+
+/* ── Score pill ── */
+.score-pill{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:50%;font-weight:800;font-size:.82rem;font-family:monospace;flex-shrink:0}
+.score-high{background:rgba(34,197,94,.15); color:var(--green);border:1.5px solid rgba(34,197,94,.4)}
+.score-mid {background:rgba(245,158,11,.15);color:var(--amber);border:1.5px solid rgba(245,158,11,.4)}
+.score-low {background:rgba(239,68,68,.15); color:var(--red);  border:1.5px solid rgba(239,68,68,.4)}
+
+/* ── Factor chips ── */
+.factor-mini{display:flex;gap:2px;align-items:center}
+.factor-chip{width:10px;height:20px;border-radius:2px;cursor:help;transition:transform .1s;position:relative}
+.factor-chip:hover{transform:scaleY(1.35)}
+.chip-high{background:var(--green);opacity:.8}
+.chip-mid {background:var(--amber);opacity:.8}
+.chip-low {background:var(--red);  opacity:.8}
+
+/* ── Expanded panel ── */
+.factor-panel td{padding:0;background:var(--surface);border-bottom:2px solid var(--gold-d)}
+.factor-panel-inner{padding:.9rem 1.25rem}
+.panel-tabs{display:flex;gap:.5rem;margin-bottom:.75rem;border-bottom:1px solid var(--border);padding-bottom:.5rem}
+.ptab{font-size:.75rem;font-weight:600;padding:.25rem .7rem;border-radius:5px;cursor:pointer;color:var(--muted)}
+.ptab.active{background:rgba(240,160,48,.15);color:var(--gold)}
+.factor-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:.55rem}
+.factor-row{background:var(--card);border:1px solid var(--border);border-radius:7px;padding:.5rem .8rem;display:flex;align-items:center;gap:.7rem}
+.factor-bar-wrap{flex:1;background:rgba(255,255,255,.05);border-radius:3px;height:5px;overflow:hidden}
+.factor-bar{height:100%;border-radius:3px;transition:width .4s ease}
+.factor-name{font-size:.76rem;font-weight:600;width:120px;flex-shrink:0}
+.factor-score{font-size:.76rem;font-weight:700;font-family:monospace;width:28px;flex-shrink:0;text-align:right}
+.factor-detail{font-size:.7rem;color:var(--dim);margin-top:.15rem;white-space:normal;line-height:1.4}
+
+/* ── Horse profile ── */
+.profile-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.6rem}
+.profile-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.65rem .9rem}
+.profile-card-title{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:.4rem}
+.profile-match{display:flex;align-items:center;gap:.4rem;font-size:.8rem;margin-bottom:.2rem}
+.match-ok  {color:var(--green)}
+.match-warn{color:var(--amber)}
+.match-bad {color:var(--red)}
+.profile-detail{font-size:.73rem;color:var(--muted);line-height:1.5}
+
+/* ── Welcome ── */
+#welcome{text-align:center;padding:3.5rem 1rem;color:var(--dim)}
+#welcome.hide{display:none}
+.welcome-icon{font-size:3rem;margin-bottom:.75rem}
+.welcome-title{font-size:1.35rem;font-weight:700;color:var(--muted);margin-bottom:.4rem}
+.welcome-sub{font-size:.88rem;max-width:460px;margin:0 auto;line-height:1.75}
+
+/* ── Tooltip ── */
+[data-tip]{position:relative}
+[data-tip]::after{content:attr(data-tip);position:absolute;bottom:130%;left:50%;transform:translateX(-50%);background:#1e2030;border:1px solid var(--border);border-radius:5px;padding:.28rem .5rem;font-size:.7rem;color:var(--text);white-space:nowrap;pointer-events:none;opacity:0;transition:opacity .15s;z-index:100}
+[data-tip]:hover::after{opacity:1}
+
+/* ── Image panel ── */
+.upload-card-status.error{color:var(--red)}
+.upload-card-status.uploading{color:var(--amber)}
+.image-summary{font-size:.72rem;color:var(--muted);margin-top:.3rem;line-height:1.45;white-space:normal;max-width:100%}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════ HEADER ═══════════════════════════ -->
+<header>
+<div class="container">
+  <div class="header-inner">
+    <a class="brand" href="/"><div class="brand-icon">EA</div>
+      <div class="brand-text">
+        <div class="brand-name">Envelope Analyser</div>
+        <div class="brand-sub">Racing Intelligence</div>
+      </div>
+    </a>
+    <form class="url-form" onsubmit="return false">
+      <input class="url-input" id="url-input" type="url"
+             placeholder="Paste Sporting Life race card URL…" autocomplete="off">
+      <button class="btn btn-gold" type="button" id="analyse-btn" onclick="analyse()">Analyse</button>
+      <button class="btn btn-ghost" type="button" onclick="loadSample()">Sample Race</button>
+    </form>
+    <div id="loading"><div class="spinner"></div><span>Fetching…</span></div>
+  </div>
+</div>
+</header>
+
+<!-- ═══════════════════════════ MAIN ════════════════════════════ -->
+<div class="container">
+
+<div id="error-banner"></div>
+
+<!-- ─── Stats Upload Panel ─── -->
+<div class="stats-panel" id="stats-panel">
+  <div class="stats-panel-header" onclick="toggleStats()">
+    <span class="stats-toggle">📊 Course Stats &amp; Conditions</span>
+    <span class="stats-pill" id="sp-trainers">Trainers —</span>
+    <span class="stats-pill" id="sp-jockeys">Jockeys —</span>
+    <span class="stats-pill" id="sp-trends">Trends —</span>
+    <span class="stats-pill" id="sp-prices">Prices —</span>
+    <button class="btn btn-danger btn-sm" onclick="clearStats(event)">Clear All</button>
+    <span id="stats-arrow" style="color:var(--dim);font-size:.9rem">▾</span>
+  </div>
+  <div class="stats-body" id="stats-body">
+    <!-- File uploads row -->
+    <div class="stats-grid">
+      <div class="upload-card">
+        <div class="upload-card-label">Top Trainers</div>
+        <label class="file-btn"><span>📂 Upload CSV</span>
+          <input type="file" accept=".csv,.txt,.tsv" onchange="uploadFile('trainers',this)">
+        </label>
+        <div class="upload-card-status pending" id="st-trainers">Not loaded</div>
+      </div>
+      <div class="upload-card">
+        <div class="upload-card-label">Top Jockeys</div>
+        <label class="file-btn"><span>📂 Upload CSV</span>
+          <input type="file" accept=".csv,.txt,.tsv" onchange="uploadFile('jockeys',this)">
+        </label>
+        <div class="upload-card-status pending" id="st-jockeys">Not loaded</div>
+      </div>
+      <div class="upload-card">
+        <div class="upload-card-label">10-Year Trends</div>
+        <label class="file-btn"><span>📂 Upload file</span>
+          <input type="file" accept=".csv,.txt" onchange="uploadFile('trends',this)">
+        </label>
+        <div class="upload-card-status pending" id="st-trends">Not loaded</div>
+      </div>
+      <div class="upload-card">
+        <div class="upload-card-label">Traveller's Check</div>
+        <label class="file-btn"><span>📂 Upload CSV</span>
+          <input type="file" accept=".csv,.txt,.tsv" onchange="uploadFile('travellers',this)">
+        </label>
+        <div class="upload-card-status pending" id="st-travellers">Not loaded</div>
+      </div>
+      <div class="upload-card">
+        <div class="upload-card-label">Favourites Success</div>
+        <label class="file-btn"><span>📂 Upload file</span>
+          <input type="file" accept=".csv,.txt" onchange="uploadFile('favourites',this)">
+        </label>
+        <div class="upload-card-status pending" id="st-favourites">Not loaded</div>
+      </div>
+      <div class="upload-card">
+        <div class="upload-card-label">Market Prices</div>
+        <label class="file-btn"><span>📂 Upload file</span>
+          <input type="file" accept=".csv,.txt" onchange="uploadFile('prices',this)">
+        </label>
+        <div class="upload-card-status pending" id="st-prices">Not loaded</div>
+      </div>
+    </div>
+
+    <!-- Text inputs row -->
+    <div class="text-row">
+      <div class="text-input-group">
+        <label for="going-input">Going Report</label>
+        <div style="display:flex;gap:.4rem">
+          <input class="text-input" id="going-input" type="text"
+                 placeholder="e.g. Good to Soft (GoingStick 6.3), watered overnight">
+          <button class="btn btn-ghost btn-sm" onclick="submitGoing()">Set</button>
+        </div>
+        <div class="upload-card-status pending" id="st-going" style="margin-top:.3rem">Not set</div>
+      </div>
+      <div class="text-input-group">
+        <label for="hot-input">Hot Trainers</label>
+        <div style="display:flex;gap:.4rem">
+          <input class="text-input" id="hot-input" type="text"
+                 placeholder="e.g. Mullins – 8 from 14, Henderson, Skelton">
+          <button class="btn btn-ghost btn-sm" onclick="submitHotTrainers()">Set</button>
+        </div>
+        <div class="upload-card-status pending" id="st-hot" style="margin-top:.3rem">Not set</div>
+      </div>
+    </div>
+
+    <!-- Fav display (populated after upload) -->
+    <div class="fav-display" id="fav-display" style="display:none"></div>
+  </div>
+</div>
+
+<!-- ─── Pre-Meeting Image Upload Panel ─── -->
+<div class="stats-panel" id="image-panel">
+  <div class="stats-panel-header" onclick="toggleImagePanel()">
+    <span class="stats-toggle">📸 Pre-Meeting Image Upload</span>
+    <span class="stats-pill" id="ip-count">0 / 5 uploaded</span>
+    <span id="image-arrow" style="color:var(--dim);font-size:.9rem">▾</span>
+  </div>
+  <div class="stats-body" id="image-body">
+    <div class="stats-grid">
+
+      <div class="upload-card">
+        <div class="upload-card-label">Ten Year Trends</div>
+        <label class="file-btn"><span>📷 Upload Image</span>
+          <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                 onchange="uploadImage('ten_year_trends',this)">
+        </label>
+        <div class="upload-card-status pending" id="is-ten_year_trends">Not uploaded</div>
+        <div class="image-summary" id="sum-ten_year_trends" style="display:none"></div>
+      </div>
+
+      <div class="upload-card">
+        <div class="upload-card-label">Top Trainers</div>
+        <label class="file-btn"><span>📷 Upload Image</span>
+          <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                 onchange="uploadImage('top_trainers',this)">
+        </label>
+        <div class="upload-card-status pending" id="is-top_trainers">Not uploaded</div>
+        <div class="image-summary" id="sum-top_trainers" style="display:none"></div>
+      </div>
+
+      <div class="upload-card">
+        <div class="upload-card-label">Top Jockeys</div>
+        <label class="file-btn"><span>📷 Upload Image</span>
+          <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                 onchange="uploadImage('top_jockeys',this)">
+        </label>
+        <div class="upload-card-status pending" id="is-top_jockeys">Not uploaded</div>
+        <div class="image-summary" id="sum-top_jockeys" style="display:none"></div>
+      </div>
+
+      <div class="upload-card">
+        <div class="upload-card-label">Going Report</div>
+        <label class="file-btn"><span>📷 Upload Image</span>
+          <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                 onchange="uploadImage('going_report',this)">
+        </label>
+        <div class="upload-card-status pending" id="is-going_report">Not uploaded</div>
+        <div class="image-summary" id="sum-going_report" style="display:none"></div>
+      </div>
+
+      <div class="upload-card">
+        <div class="upload-card-label">Traveller's Check</div>
+        <label class="file-btn"><span>📷 Upload Image</span>
+          <input type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                 onchange="uploadImage('travellers_check',this)">
+        </label>
+        <div class="upload-card-status pending" id="is-travellers_check">Not uploaded</div>
+        <div class="image-summary" id="sum-travellers_check" style="display:none"></div>
+      </div>
+
+    </div>
+    <p style="font-size:.7rem;color:var(--dim);margin-top:.5rem">
+      Each image is sent to Claude for extraction. Data is stored for this session only and clears on server restart.
+      Requires <code style="color:var(--muted)">ANTHROPIC_API_KEY</code> environment variable.
+    </p>
+  </div>
+</div>
+
+<!-- ─── Welcome ─── -->
+<div id="welcome">
+  <div class="welcome-icon">🏇</div>
+  <div class="welcome-title">Race Card Analyser</div>
+  <div class="welcome-sub">
+    Upload your course stats above, paste a <strong>Sporting Life</strong> race card URL and click <em>Analyse</em>,
+    or try <em>Sample Race</em> to explore the tool.<br><br>
+    Each runner scored across <strong>12 analytical factors</strong>.
+    Market prices are used only to flag divergences — selections are driven by data.
+  </div>
+</div>
+
+<!-- ─── Selections ─── -->
+<div class="selections" id="selections" style="display:none">
+  <div class="selection-card sel-winner" id="sel-winner">
+    <div class="empty-sel">No data loaded</div>
+  </div>
+  <div class="selection-card sel-ew" id="sel-ew">
+    <div class="empty-sel">No data loaded</div>
+  </div>
+</div>
+
+<!-- ─── Race info bar ─── -->
+<div id="race-info"></div>
+
+<!-- ─── Runners table ─── -->
+<div id="runners-section">
+  <div class="table-wrap">
+    <table id="runners-table">
+      <thead><tr>
+        <th data-sort="rank">Rank</th>
+        <th>#</th>
+        <th>Horse</th>
+        <th>Jockey / Trainer</th>
+        <th data-sort="or" data-tip="Official Rating">OR</th>
+        <th>Form</th>
+        <th data-sort="score">Score ▾</th>
+        <th data-tip="12-factor heatmap — click row to expand">Factors</th>
+        <th>Odds</th>
+      </tr></thead>
+      <tbody id="runners-body"></tbody>
+    </table>
+  </div>
+  <p style="font-size:.7rem;color:var(--dim);margin-top:.4rem;padding-left:.4rem">
+    Click any row to expand the 12-factor breakdown and horse profile.
+    Market odds are shown for context only — selections are driven by analytical score.
+  </p>
+</div>
+
+</div><!-- .container -->
+
+<script>
+'use strict';
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let currentData = null;
+let sortCol = 'score', sortDir = -1;
+let expandedRow = null;
+let statsOpen = false;
+let courseStats = {};
+
+// ── Colour helpers ─────────────────────────────────────────────────────────────
+const scoreClass = s => s >= 6.5 ? 'score-high' : s >= 4.5 ? 'score-mid' : 'score-low';
+const chipClass  = s => s >= 6.5 ? 'chip-high'  : s >= 4.5 ? 'chip-mid'  : 'chip-low';
+const barColor   = s => s >= 6.5 ? 'var(--green)': s >= 4.5 ? 'var(--amber)' : 'var(--red)';
+
+// ── Stats panel ───────────────────────────────────────────────────────────────
+function toggleStats() {
+  statsOpen = !statsOpen;
+  document.getElementById('stats-body').classList.toggle('open', statsOpen);
+  document.getElementById('stats-arrow').textContent = statsOpen ? '▴' : '▾';
+}
+
+async function uploadFile(type, input) {
+  const file = input.files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('type', type);
+  fd.append('file', file);
+  try {
+    const resp = await fetch('/api/upload-stats', {method:'POST', body: fd});
+    const json = await resp.json();
+    if (!resp.ok) { alert('Upload error: ' + (json.detail || resp.status)); return; }
+    refreshStatsSummary(json, type);
+  } catch(e) { alert('Network error: ' + e.message); }
+}
+
+async function submitGoing() {
+  const going = document.getElementById('going-input').value.trim();
+  if (!going) return;
+  const resp = await fetch('/api/set-going', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({going})});
+  const json = await resp.json();
+  const el = document.getElementById('st-going');
+  el.textContent = json.going_override ? `✅ Set — ${json.going_report}` : `⚠ Could not parse going`;
+  el.className = 'upload-card-status ' + (json.going_override ? 'ok' : 'pending');
+}
+
+async function submitHotTrainers() {
+  const names = document.getElementById('hot-input').value.trim();
+  if (!names) return;
+  const resp = await fetch('/api/set-hot-trainers', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({names})});
+  const json = await resp.json();
+  const el = document.getElementById('st-hot');
+  el.textContent = json.hot_trainers.length
+    ? `✅ ${json.hot_trainers.length} trainer(s): ${json.hot_trainers.slice(0,3).join(', ')}`
+    : 'No names found';
+  el.className = 'upload-card-status ' + (json.hot_trainers.length ? 'ok' : 'pending');
+}
+
+async function clearStats(e) {
+  e.stopPropagation();
+  await fetch('/api/course-stats', {method:'DELETE'});
+  // Reset all status labels
+  ['trainers','jockeys','trends','travellers','favourites','prices'].forEach(t => {
+    const el = document.getElementById(`st-${t}`);
+    if (el) { el.textContent = 'Not loaded'; el.className = 'upload-card-status pending'; }
+    const pill = document.getElementById(`sp-${t}`);
+    if (pill) { pill.textContent = t.charAt(0).toUpperCase() + t.slice(1) + ' —'; pill.className = 'stats-pill'; }
+  });
+  ['going','hot'].forEach(t => {
+    const el = document.getElementById(`st-${t}`);
+    if (el) { el.textContent = 'Not set'; el.className = 'upload-card-status pending'; }
+  });
+  document.getElementById('fav-display').style.display = 'none';
+}
+
+function refreshStatsSummary(json, type) {
+  const labelMap = {
+    trainers: 'Trainers', jockeys: 'Jockeys', trends: 'Trends',
+    travellers: 'Travellers', favourites: 'Favs', prices: 'Prices'
+  };
+  const countKey = {trainers:'loaded', jockeys:'loaded', trends:'loaded', travellers:'loaded', prices:'loaded'};
+  const count = json[countKey[type] || 'loaded'] ?? null;
+
+  const st = document.getElementById(`st-${type}`);
+  if (st) {
+    st.textContent = count !== null ? `✅ ${count} entries loaded` : '✅ Loaded';
+    st.className = 'upload-card-status ok';
+  }
+  const pill = document.getElementById(`sp-${type}`);
+  if (pill) {
+    pill.textContent = `${labelMap[type] || type} ✅`;
+    pill.className = 'stats-pill loaded';
+  }
+  // Favourites special display
+  if (type === 'favourites' && (json.win_rate !== null || json.place_rate !== null)) {
+    const fav = document.getElementById('fav-display');
+    fav.style.display = '';
+    fav.innerHTML = `<strong>Favourites at this course:</strong> `
+      + (json.win_rate !== null ? `Win ${(json.win_rate*100).toFixed(1)}%` : '')
+      + (json.place_rate !== null ? ` · Place ${(json.place_rate*100).toFixed(1)}%` : '');
+  }
+}
+
+// ── API calls ──────────────────────────────────────────────────────────────────
+async function analyse() {
+  const url = document.getElementById('url-input').value.trim();
+  if (!url) { showError('Please paste a Sporting Life race card URL.'); return; }
+  await fetchData('/api/analyse', 'POST', {url});
+}
+async function loadSample() { await fetchData('/api/sample', 'GET'); }
+
+async function fetchData(endpoint, method, body) {
+  setLoading(true); hideError();
+  try {
+    const opts = {method, headers:{'Content-Type':'application/json'}};
+    if (body) opts.body = JSON.stringify(body);
+    const resp = await fetch(endpoint, opts);
+    const json = await resp.json();
+    if (!resp.ok) { showError(json.detail || `Server error (${resp.status})`); return; }
+    currentData = json;
+    courseStats = json.course_stats || {};
+    render(json);
+  } catch(e) { showError('Network error: ' + e.message); }
+  finally { setLoading(false); }
+}
+
+// ── Render ─────────────────────────────────────────────────────────────────────
+function render(data) {
+  document.getElementById('welcome').classList.add('hide');
+  renderRaceInfo(data.race, data.course_stats);
+  renderSelections(data.selections);
+  renderTable(data.runners);
+}
+
+function renderRaceInfo(race, cs) {
+  const el = document.getElementById('race-info');
+  const dist = race.distance_furlongs
+    ? `${race.distance_furlongs}f (${(race.distance_furlongs * 0.125).toFixed(2)}m)` : '';
+  let extra = '';
+  if (cs && cs.fav_win_rate !== null && cs.fav_win_rate !== undefined)
+    extra = `<span class="fav-stat">Favs win ${cs.fav_win_rate}% here</span>`;
+  if (cs && cs.going_override)
+    extra += `<span class="fav-stat">🌤 Going (report): ${esc(cs.going_override)}</span>`;
+  el.innerHTML = `
+    <span class="race-title">${esc(race.title)}</span>
+    ${pill('📍', race.venue)} ${pill('📅', race.date)}
+    ${race.race_class ? pill('🏅', race.race_class) : ''}
+    ${dist ? pill('📏', dist) : ''}
+    ${race.going ? pill('🌤', race.going) : ''}
+    ${race.prize_money ? pill('💷', race.prize_money) : ''}
+    ${pill('🐎', `${race.total_runners} runners`)} ${extra}
+  `;
+  el.classList.add('show');
+}
+function pill(icon, text) {
+  return text ? `<span class="race-pill">${icon} ${esc(String(text))}</span>` : '';
+}
+
+function renderSelections(sels) {
+  document.getElementById('selections').style.display = '';
+  document.getElementById('sel-winner').innerHTML =
+    sels.winner ? selCard(sels.winner, 'Winner', 'var(--gold)', sels.alignment) : '<div class="empty-sel">No winner</div>';
+  document.getElementById('sel-ew').innerHTML =
+    sels.each_way ? selCard(sels.each_way, 'Each Way Value', 'var(--blue)', null) : '<div class="empty-sel">No each-way value found</div>';
+}
+
+function selCard(s, label, color, alignment) {
+  const flagBadge = s.flagged_trainer
+    ? `<span class="badge badge-danger">🚩 ${esc(s.trainer)}</span>`
+    : `<span style="color:var(--muted);font-size:.78rem">${esc(s.trainer)}</span>`;
+  const hotBadge = s.hot_trainer ? `<span class="badge badge-hot">🔥 Hot</span>` : '';
+
+  let alignHTML = '';
+  if (alignment) {
+    const cls = alignment.status === 'aligned' ? 'align-ok'
+              : alignment.status === 'switch_possible' ? 'align-switch' : 'align-warn';
+    alignHTML = `<div class="alignment-bar ${cls}">${esc(alignment.note)}</div>`;
+    if (alignment.market_alt) {
+      const ma = alignment.market_alt;
+      alignHTML += `<div class="market-alt">Market alt: <strong>${esc(ma.name)}</strong>
+        — Score ${ma.score.toFixed(2)} | ${esc(ma.odds)}</div>`;
+    }
+  }
+
+  return `
+    <div class="sel-label">${label}</div>
+    <div class="sel-horse">${esc(s.name)}</div>
+    <div class="sel-meta">
+      <span class="sel-odds">${esc(s.odds)}</span>
+      ${flagBadge} ${hotBadge}
+      <span style="color:var(--muted);font-size:.78rem">${esc(s.jockey)}</span>
+    </div>
+    ${alignHTML}
+    <div class="sel-score" style="color:${color}">${s.score.toFixed(2)}</div>
+  `;
+}
+
+// ── Table ─────────────────────────────────────────────────────────────────────
+function renderTable(runners) {
+  const sorted = sortRunners(runners);
+  const tbody = document.getElementById('runners-body');
+  tbody.innerHTML = '';
+  expandedRow = null;
+  sorted.forEach((sr, idx) => {
+    const row = document.createElement('tr');
+    row.dataset.idx = idx;
+    row.innerHTML = rowHTML(sr);
+    row.addEventListener('click', () => toggleExpand(row, sr, currentData.race));
+    tbody.appendChild(row);
+  });
+  document.querySelectorAll('thead th[data-sort]').forEach(th => {
+    th.classList.remove('sort-asc', 'sort-desc');
+    if (th.dataset.sort === sortCol)
+      th.classList.add(sortDir < 0 ? 'sort-desc' : 'sort-asc');
+  });
+  document.getElementById('runners-section').classList.add('show');
+}
+
+function rowHTML(sr) {
+  const r = sr.runner;
+  const rCls = sr.rank <= 3 ? `rank-${sr.rank}` : '';
+  const wt = r.weight_st != null ? `${r.weight_st}-${r.weight_lb ?? 0}` : '';
+
+  // Trainer badges
+  let tBadges = '';
+  if (r.flagged_trainer)      tBadges += '<span class="badge badge-danger">🚩</span> ';
+  if (r.multi_runner_trainer) tBadges += '<span class="badge badge-warning">✦ Multi</span> ';
+  if (r.hot_trainer)          tBadges += '<span class="badge badge-hot">🔥</span> ';
+  const trainerLine = r.trainer
+    ? `<span style="display:flex;align-items:center;gap:.3rem;flex-wrap:wrap">${esc(r.trainer)} ${tBadges}</span>`
+    : '<span style="color:var(--dim)">—</span>';
+
+  // Horse badges
+  let hBadges = '';
+  if (r.course_winner) hBadges += `<span class="badge badge-course" title="${esc(r.course_winner_msg)}">⭐ Course W</span> `;
+  if (r.seconditis)    hBadges += `<span class="badge badge-warning" title="${esc(r.seconditis_msg)}">2nd Habit</span> `;
+  if (r.trip_change === 'up')   hBadges += `<span class="badge badge-info"    title="${esc(r.trip_change_msg)}">⬆ Trip Up</span> `;
+  if (r.trip_change === 'down') hBadges += `<span class="badge badge-neutral" title="${esc(r.trip_change_msg)}">⬇ Trip Dn</span> `;
+
+  const chips = sr.factors.map(f =>
+    `<div class="factor-chip ${chipClass(f.score)}" data-tip="${esc(f.name)}: ${f.score.toFixed(1)}"></div>`
+  ).join('');
+
+  return `
+    <td class="td-rank mono ${rCls}">${sr.rank}</td>
+    <td class="mono" style="color:var(--dim)">${r.number || '—'}</td>
+    <td>
+      <div class="horse-name">${esc(r.name)}</div>
+      <div class="horse-meta mono">${r.age ? r.age + 'yo' : ''} ${wt} ${r.draw ? '| D' + r.draw : ''}</div>
+      ${hBadges ? `<div style="margin-top:.2rem;display:flex;flex-wrap:wrap;gap:.25rem">${hBadges}</div>` : ''}
+    </td>
+    <td>
+      <div style="font-size:.8rem">${r.jockey ? esc(r.jockey) : '—'}</div>
+      <div style="font-size:.76rem">${trainerLine}</div>
+    </td>
+    <td class="mono" style="color:var(--muted)">${r.official_rating ?? '—'}</td>
+    <td class="mono" style="letter-spacing:.05em">${esc(r.form || '—')}</td>
+    <td><div class="score-pill ${scoreClass(sr.total_score)}">${sr.total_score.toFixed(2)}</div></td>
+    <td><div class="factor-mini">${chips}</div></td>
+    <td class="mono" style="font-weight:600">${esc(r.odds || '—')}</td>
+  `;
+}
+
+// ── Expanded panel ─────────────────────────────────────────────────────────────
+function toggleExpand(row, sr, race) {
+  document.querySelector('.factor-panel')?.remove();
+  document.querySelector('tr.expanded')?.classList.remove('expanded');
+  if (expandedRow === row) { expandedRow = null; return; }
+  expandedRow = row;
+  row.classList.add('expanded');
+  const pr = document.createElement('tr');
+  pr.className = 'factor-panel';
+  pr.innerHTML = `<td colspan="${row.cells.length}">
+    <div class="factor-panel-inner">${panelHTML(sr, race)}</div>
+  </td>`;
+  row.after(pr);
+}
+
+function panelHTML(sr, race) {
+  const r = sr.runner;
+  return `
+    <div style="display:flex;align-items:center;gap:.85rem;margin-bottom:.75rem">
+      <div class="score-pill ${scoreClass(sr.total_score)}" style="width:46px;height:46px;font-size:.95rem">${sr.total_score.toFixed(2)}</div>
+      <div>
+        <div style="font-weight:700;font-size:.93rem">${esc(r.name)}</div>
+        <div style="font-size:.73rem;color:var(--muted)">12-Factor Analysis · Horse Profile</div>
+      </div>
+    </div>
+    <div class="panel-tabs">
+      <span class="ptab active" onclick="switchPTab(this,'pf-factors-${sr.rank}')">12 Factors</span>
+      <span class="ptab" onclick="switchPTab(this,'pf-profile-${sr.rank}')">Horse Profile</span>
+    </div>
+    <div id="pf-factors-${sr.rank}">
+      <div class="factor-grid">${sr.factors.map(f => factorCard(f)).join('')}</div>
+    </div>
+    <div id="pf-profile-${sr.rank}" style="display:none">
+      ${profileHTML(r, race)}
+    </div>
+  `;
+}
+
+function switchPTab(btn, showId) {
+  const panel = btn.closest('.factor-panel-inner');
+  panel.querySelectorAll('.ptab').forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  // Hide all pf- divs in this panel
+  panel.querySelectorAll('[id^="pf-"]').forEach(d => d.style.display = 'none');
+  document.getElementById(showId).style.display = '';
+}
+
+function factorCard(f) {
+  return `
+    <div class="factor-row">
+      <span class="factor-name">${esc(f.name)}</span>
+      <div class="factor-bar-wrap">
+        <div class="factor-bar" style="width:${f.score*10}%;background:${barColor(f.score)}"></div>
+      </div>
+      <span class="factor-score" style="color:${barColor(f.score)}">${f.score.toFixed(1)}</span>
+      <span style="font-size:.7rem;color:var(--dim);flex:1;white-space:normal;line-height:1.4">${esc(f.detail)}</span>
+    </div>`;
+}
+
+// ── Horse Profile panel ────────────────────────────────────────────────────────
+function profileHTML(r, race) {
+  const todayGoing = (courseStats.going_override || race.going || '').toLowerCase();
+  const todayDist  = race.distance_furlongs || 0;
+  const cards = [];
+
+  // Going preference
+  let goingPref = 'Unknown', goingMatch = 'neutral';
+  if (r.going_record && Object.keys(r.going_record).length) {
+    const best = Object.entries(r.going_record)
+      .filter(([,v]) => v[1] >= 2)
+      .sort(([,a],[,b]) => (b[0]/b[1]) - (a[0]/a[1]))[0];
+    if (best) {
+      goingPref = best[0];
+      const similar = goingBucketsMatch(goingPref, todayGoing);
+      goingMatch = similar ? 'ok' : todayGoing ? 'warn' : 'neutral';
+    }
+  } else if (r.sire) {
+    goingPref = `By ${r.sire}`;
+    goingMatch = 'neutral';
+  }
+  cards.push(profileCard('Going Preference', goingPref, goingMatch,
+    `Today: ${race.going || '—'}`,
+    goingMatch === 'ok' ? '✅ Conditions suit' : goingMatch === 'warn' ? '⚠ May not suit ground' : '— Neutral'));
+
+  // Distance preference
+  let distPref = 'Unknown', distMatch = 'neutral';
+  if (r.distance_record && Object.keys(r.distance_record).length) {
+    const best = Object.entries(r.distance_record)
+      .filter(([,v]) => v[1] >= 2)
+      .sort(([,a],[,b]) => (b[0]/b[1]) - (a[0]/a[1]))[0];
+    if (best) {
+      distPref = `${best[0]}f (${best[1][0]}W-${best[1][1]}R)`;
+      const match = todayDist > 0 && Math.abs(parseFloat(best[0]) - todayDist) <= 1;
+      distMatch = match ? 'ok' : todayDist ? 'warn' : 'neutral';
+    }
+  } else if (r.or_trip_history && r.or_trip_history.length) {
+    const avg = r.or_trip_history.reduce((a,b)=>a+b,0)/r.or_trip_history.length;
+    distPref = `~${avg.toFixed(0)}f (avg of recent trips)`;
+    distMatch = todayDist && Math.abs(avg - todayDist) <= 1.5 ? 'ok' : 'neutral';
+  }
+  cards.push(profileCard('Distance Preference', distPref, distMatch,
+    `Today: ${todayDist ? todayDist+'f' : '—'}`,
+    distMatch === 'ok' ? '✅ Distance suits' : distMatch === 'warn' ? '⚠ Trip may not suit' : '— No data'));
+
+  // Course record
+  const cwNote = r.course_wins > 0
+    ? `${r.course_wins}W from ${r.course_runs}R at ${race.venue}`
+    : r.course_runs > 0 ? `${r.course_runs}R, no wins at ${race.venue}` : `No previous runs at ${race.venue}`;
+  cards.push(profileCard('Course Record', race.venue || '—', r.course_wins > 0 ? 'ok' : r.course_runs > 0 ? 'warn' : 'neutral',
+    cwNote, r.course_wins > 0 ? '⭐ Course winner' : r.course_runs > 0 ? '— Runs but no wins' : '— Course debutant'));
+
+  // Running style
+  const style = r.running_style || 'Unknown';
+  const styleFactor = (sr => sr && sr.factors.find(f => f.key === 'running_style'))(currentData.runners.find(s => s.runner.name === r.name));
+  const styleScore = styleFactor ? styleFactor.score : 5;
+  const styleMatch = styleScore >= 7 ? 'ok' : styleScore >= 4.5 ? 'neutral' : 'warn';
+  const styleLead = /lead|prominent/i.test(style) ? '🏃 Likes to run from the front' :
+                    /hold|rear|back/i.test(style)  ? '🎯 Hold-up horse — needs to come late' :
+                    '↔ Midfield / versatile';
+  cards.push(profileCard('Running Style', style, styleMatch,
+    styleLead, styleScore >= 7 ? '✅ Style suits today' : styleScore < 4.5 ? '⚠ Style may be compromised' : '— Workable'));
+
+  // Freshness
+  const days = r.days_since_last_run;
+  const freshMatch = days == null ? 'neutral' : days >= 14 && days <= 30 ? 'ok' : days > 90 ? 'warn' : 'neutral';
+  cards.push(profileCard('Freshness',
+    days != null ? `${days} days since last run` : 'Unknown',
+    freshMatch,
+    days >= 14 && days <= 30 ? 'Optimal fitness window' : days < 14 ? 'Quick turnaround' : days > 90 ? 'Extended absence' : '—',
+    freshMatch === 'ok' ? '✅ Well-prepared' : freshMatch === 'warn' ? '⚠ Ring-rusty possible' : '—'));
+
+  return `<div class="profile-grid">${cards.join('')}</div>`;
+}
+
+function profileCard(title, value, matchState, sub1, sub2) {
+  const icon = matchState === 'ok' ? '✅' : matchState === 'warn' ? '⚠' : '—';
+  const cls  = matchState === 'ok' ? 'match-ok' : matchState === 'warn' ? 'match-warn' : '';
+  return `
+    <div class="profile-card">
+      <div class="profile-card-title">${esc(title)}</div>
+      <div class="profile-match ${cls}">${icon} <strong>${esc(value)}</strong></div>
+      <div class="profile-detail">${esc(sub1)}</div>
+      <div class="profile-detail" style="margin-top:.1rem">${esc(sub2)}</div>
+    </div>`;
+}
+
+function goingBucketsMatch(a, b) {
+  const buckets = {
+    heavy:['heavy','soft'], soft:['heavy','soft','good_soft'],
+    good_soft:['soft','good_soft','good'], good:['good_soft','good','good_firm'],
+    good_firm:['good','good_firm','firm'], firm:['good_firm','firm'],
+  };
+  const norm = s => s.toLowerCase().replace(/\s+/g,'_').replace('to_','');
+  const an = norm(a), bn = norm(b);
+  return an === bn || (buckets[an] || []).includes(bn) || (buckets[bn] || []).includes(an);
+}
+
+// ── Sorting ───────────────────────────────────────────────────────────────────
+document.querySelectorAll('thead th[data-sort]').forEach(th => {
+  th.addEventListener('click', () => {
+    if (sortCol === th.dataset.sort) sortDir *= -1;
+    else { sortCol = th.dataset.sort; sortDir = -1; }
+    if (currentData) renderTable(currentData.runners);
+  });
+});
+
+function sortRunners(runners) {
+  return [...runners].sort((a, b) => {
+    let va, vb;
+    switch (sortCol) {
+      case 'score': va = a.total_score; vb = b.total_score; break;
+      case 'rank':  va = a.rank;        vb = b.rank;        break;
+      case 'or':    va = a.runner.official_rating ?? -1; vb = b.runner.official_rating ?? -1; break;
+      default: return 0;
+    }
+    return sortDir * (vb - va);
+  });
+}
+
+// ── UI helpers ─────────────────────────────────────────────────────────────────
+function setLoading(v) {
+  document.getElementById('loading').classList.toggle('show', v);
+  document.getElementById('analyse-btn').disabled = v;
+}
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.textContent = '⚠ ' + msg; el.classList.add('show');
+}
+function hideError() { document.getElementById('error-banner').classList.remove('show'); }
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+document.getElementById('url-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') analyse();
+});
+
+// ── Pre-meeting image upload panel ────────────────────────────────────────────
+const IMAGE_LABELS = ['ten_year_trends','top_trainers','top_jockeys','going_report','travellers_check'];
+let imagePanelOpen = false;
+
+function toggleImagePanel() {
+  imagePanelOpen = !imagePanelOpen;
+  document.getElementById('image-body').classList.toggle('open', imagePanelOpen);
+  document.getElementById('image-arrow').textContent = imagePanelOpen ? '▴' : '▾';
+}
+
+async function uploadImage(label, input) {
+  const file = input.files[0];
+  if (!file) return;
+  const statusEl  = document.getElementById(`is-${label}`);
+  const summaryEl = document.getElementById(`sum-${label}`);
+
+  statusEl.textContent = '⏳ Sending to Claude…';
+  statusEl.className = 'upload-card-status uploading';
+  summaryEl.style.display = 'none';
+
+  const fd = new FormData();
+  fd.append('label', label);
+  fd.append('file', file);
+
+  try {
+    const resp = await fetch('/upload-context', {method: 'POST', body: fd});
+    const json = await resp.json();
+    if (!resp.ok) {
+      statusEl.textContent = '✗ ' + (json.detail || `Error ${resp.status}`);
+      statusEl.className = 'upload-card-status error';
+    } else {
+      statusEl.textContent = '✓ Extracted';
+      statusEl.className = 'upload-card-status ok';
+      summaryEl.textContent = json.summary || '';
+      summaryEl.style.display = '';
+      updateImageCount();
+    }
+  } catch(e) {
+    statusEl.textContent = '✗ Network error: ' + e.message;
+    statusEl.className = 'upload-card-status error';
+  }
+  // Allow re-uploading the same file again
+  input.value = '';
+}
+
+function updateImageCount() {
+  const done = IMAGE_LABELS.filter(s => {
+    const el = document.getElementById(`is-${s}`);
+    return el && el.classList.contains('ok');
+  }).length;
+  const pill = document.getElementById('ip-count');
+  if (pill) {
+    pill.textContent = `${done} / 5 uploaded`;
+    pill.className = 'stats-pill' + (done > 0 ? ' loaded' : '');
+  }
+}
+</script>
+</body>
+</html>
