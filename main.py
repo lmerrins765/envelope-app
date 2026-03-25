@@ -4,42 +4,45 @@ Envelope Analyser — FastAPI backend.
 from __future__ import annotations
 
 import base64
-import io
 import logging
 import os
-from typing import Any, Optional
 
 import anthropic
-import httpx
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from models import RaceCard, Runner
 from scraper import fetch_racecard, get_sample_racecard
 from scorer import score_racecard
-from course_stats import CourseStatsStore
+from course_stats import (
+    CourseStatsPack,
+    parse_name_stat_file,
+    parse_trends_file,
+    parse_travellers_file,
+    parse_favourites_file,
+    parse_going_report,
+    parse_hot_trainers,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="Envelope Analyser")
 
-# ── Static files ──────────────────────────────────────────────────────────────
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ── In-memory stores ──────────────────────────────────────────────────────────
-stats_store = CourseStatsStore()
-image_context: dict[str, str] = {}   # label → extracted text summary
+# ── In-memory state ───────────────────────────────────────────────────────────
+_stats = CourseStatsPack()
+_image_context: dict[str, str] = {}
 
-# ── Root: serve index.html ────────────────────────────────────────────────────
+# ── Root ──────────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def root():
     with open("static/index.html", encoding="utf-8") as f:
         return f.read()
 
-# ── Analyse endpoint ──────────────────────────────────────────────────────────
+# ── Analyse ───────────────────────────────────────────────────────────────────
 class AnalyseRequest(BaseModel):
     url: str
 
@@ -52,57 +55,85 @@ async def analyse(req: AnalyseRequest):
     except Exception as e:
         log.exception("Unexpected error fetching racecard")
         raise HTTPException(status_code=500, detail=str(e))
-
-    cs = stats_store.get_stats()
-    result = score_racecard(racecard, cs, image_context)
+    result = score_racecard(racecard, _stats, _image_context)
     return result
 
-# ── Sample endpoint ───────────────────────────────────────────────────────────
 @app.get("/api/sample")
 async def sample():
     racecard = get_sample_racecard()
-    cs = stats_store.get_stats()
-    result = score_racecard(racecard, cs, image_context)
+    result = score_racecard(racecard, _stats, _image_context)
     return result
 
-# ── Course stats upload ───────────────────────────────────────────────────────
+# ── Stats upload ──────────────────────────────────────────────────────────────
 @app.post("/api/upload-stats")
 async def upload_stats(
     type: str = Form(...),
     file: UploadFile = File(...),
 ):
+    global _stats
     content = await file.read()
     try:
         text = content.decode("utf-8", errors="replace")
     except Exception:
         raise HTTPException(status_code=400, detail="Could not decode file")
 
-    result = stats_store.ingest(type, text)
-    return result
+    loaded = 0
+    if type == "trainers":
+        _stats.trainers = parse_name_stat_file(text)
+        loaded = len(_stats.trainers)
+    elif type == "jockeys":
+        _stats.jockeys = parse_name_stat_file(text)
+        loaded = len(_stats.jockeys)
+    elif type == "trends":
+        _stats.trends = parse_trends_file(text)
+        loaded = len(_stats.trends)
+    elif type == "travellers":
+        _stats.travellers = parse_travellers_file(text)
+        loaded = len(_stats.travellers)
+    elif type == "favourites":
+        win_r, place_r = parse_favourites_file(text)
+        _stats.fav_win_rate = win_r
+        _stats.fav_place_rate = place_r
+        loaded = 1 if (win_r is not None or place_r is not None) else 0
+        return {"loaded": loaded, "win_rate": win_r, "place_rate": place_r}
+    elif type == "prices":
+        _stats.trends = parse_trends_file(text)
+        loaded = len(_stats.trends)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown stats type: {type}")
+
+    _stats.build_lookups()
+    return {"loaded": loaded}
 
 @app.delete("/api/course-stats")
 async def clear_stats():
-    stats_store.clear()
+    global _stats
+    _stats = CourseStatsPack()
     return {"status": "cleared"}
 
-# ── Going / hot trainers ──────────────────────────────────────────────────────
+# ── Going ─────────────────────────────────────────────────────────────────────
 class GoingRequest(BaseModel):
     going: str
 
 @app.post("/api/set-going")
 async def set_going(req: GoingRequest):
-    result = stats_store.set_going(req.going)
-    return result
+    raw, bucket = parse_going_report(req.going)
+    _stats.going_report = raw
+    _stats.going_override = bucket
+    return {"going_override": bucket, "going_report": raw}
 
+# ── Hot trainers ──────────────────────────────────────────────────────────────
 class HotTrainersRequest(BaseModel):
     names: str
 
 @app.post("/api/set-hot-trainers")
 async def set_hot_trainers(req: HotTrainersRequest):
-    result = stats_store.set_hot_trainers(req.names)
-    return result
+    names = parse_hot_trainers(req.names)
+    _stats.hot_trainers = names
+    _stats.build_lookups()
+    return {"hot_trainers": names}
 
-# ── Pre-meeting image upload (Claude vision) ──────────────────────────────────
+# ── Image upload (Claude vision) ──────────────────────────────────────────────
 @app.post("/upload-context")
 async def upload_context(
     label: str = Form(...),
@@ -137,21 +168,14 @@ async def upload_context(
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": mime,
-                                "data": b64,
-                            },
-                        },
+                        {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
                         {"type": "text", "text": prompt},
                     ],
                 }
             ],
         )
         summary = message.content[0].text if message.content else ""
-        image_context[label] = summary
+        _image_context[label] = summary
         return {"label": label, "summary": summary[:300]}
     except Exception as e:
         log.exception("Claude API error during image upload")
