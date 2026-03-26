@@ -14,7 +14,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from scraper import fetch_racecard, get_sample_racecard
-from scorer import score_racecard
 from course_stats import (
     CourseStatsPack,
     parse_name_stat_file,
@@ -25,11 +24,25 @@ from course_stats import (
     parse_hot_trainers,
 )
 
+# Import scorer — handle both possible function/class names
+try:
+    from scorer import score_racecard
+except ImportError:
+    try:
+        from scorer import ScoredRaceCard as _ScoredRaceCard
+        def score_racecard(racecard, stats, image_context):
+            return _ScoredRaceCard(racecard, stats, image_context)
+    except ImportError:
+        import scorer as _scorer
+        # Last resort: find any callable that takes a racecard
+        _fn = getattr(_scorer, [x for x in dir(_scorer) if 'score' in x.lower() or 'race' in x.lower()][0])
+        def score_racecard(racecard, stats, image_context):
+            return _fn(racecard, stats, image_context)
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="Envelope Analyser")
-
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ── In-memory state ───────────────────────────────────────────────────────────
@@ -133,7 +146,7 @@ async def set_hot_trainers(req: HotTrainersRequest):
     _stats.build_lookups()
     return {"hot_trainers": names}
 
-# ── Image upload (Claude vision) ──────────────────────────────────────────────
+# ── Image upload ──────────────────────────────────────────────────────────────
 @app.post("/upload-context")
 async def upload_context(
     label: str = Form(...),
@@ -149,7 +162,6 @@ async def upload_context(
         mime = "image/jpeg"
 
     b64 = base64.standard_b64encode(content).decode()
-
     label_prompts = {
         "ten_year_trends":  "Extract all trainer and jockey statistics, strike rates, and trends from this racing data image.",
         "top_trainers":     "Extract trainer names and their statistics (wins, runs, strike rate) from this image.",
@@ -164,15 +176,13 @@ async def upload_context(
         message = client.messages.create(
             model="claude-opus-4-5",
             max_tokens=1024,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
         )
         summary = message.content[0].text if message.content else ""
         _image_context[label] = summary
