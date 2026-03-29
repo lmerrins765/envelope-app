@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from models import RaceCard, Runner
 from scraper import fetch_racecard, get_sample_racecard
-from scorer import score_racecard
+from scorer import score_runners
 from course_stats import CourseStatsStore
 
 logging.basicConfig(level=logging.INFO)
