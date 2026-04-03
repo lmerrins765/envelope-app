@@ -54,7 +54,7 @@ async def analyse(req: AnalyseRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     cs = stats_store.get_stats()
-    result = score_racecard(racecard, cs, image_context)
+    result = score_runners(racecard, cs, image_context)
     return result
 
 # ── Sample endpoint ───────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ async def analyse(req: AnalyseRequest):
 async def sample():
     racecard = get_sample_racecard()
     cs = stats_store.get_stats()
-    result = score_racecard(racecard, cs, image_context)
+    result = score_runners(racecard, cs, image_context)
     return result
 
 # ── Course stats upload ───────────────────────────────────────────────────────
